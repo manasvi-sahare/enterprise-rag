@@ -1,9 +1,10 @@
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, VectorParams, PointStruct
+from qdrant_client.models import Distance, VectorParams, PointStruct, Filter, FieldCondition, MatchValue
 from sentence_transformers import SentenceTransformer
 from rank_bm25 import BM25Okapi
 import uuid
 import os
+from datetime import datetime
 
 # Initialize embedding model
 embedder = SentenceTransformer("all-MiniLM-L6-v2")
@@ -19,8 +20,11 @@ client.create_collection(
 )
 
 # BM25 index stored in memory
-_all_chunks = []  # list of {"text": ..., "source": ..., "clearance_level": ..., "department": ..., "author": ...}
+_all_chunks = []
 _bm25_index = None
+
+# Document registry
+_documents = {}  # filename -> metadata
 
 def _rebuild_bm25():
     global _bm25_index
@@ -64,31 +68,71 @@ def chunk_text(text: str, chunk_size: int = 500) -> list:
 
 def ingest_document(file_path: str, metadata: dict):
     global _all_chunks
+    filename = os.path.basename(file_path)
     text = parse_document(file_path)
     chunks = chunk_text(text)
 
     points = []
+    chunk_ids = []
     for chunk in chunks:
         embedding = embedder.encode(chunk).tolist()
+        chunk_id = str(uuid.uuid4())
         chunk_data = {
             "text": chunk,
-            "source": os.path.basename(file_path),
+            "source": filename,
             **metadata
         }
         point = PointStruct(
-            id=str(uuid.uuid4()),
+            id=chunk_id,
             vector=embedding,
             payload=chunk_data
         )
         points.append(point)
         _all_chunks.append(chunk_data)
+        chunk_ids.append(chunk_id)
 
     client.upsert(collection_name=COLLECTION_NAME, points=points)
     _rebuild_bm25()
+
+    # Register document
+    _documents[filename] = {
+        "filename": filename,
+        "department": metadata.get("department", "general"),
+        "author": metadata.get("author", "unknown"),
+        "clearance_level": metadata.get("clearance_level", "public"),
+        "chunks": len(chunks),
+        "uploaded_at": datetime.utcnow().isoformat(),
+        "chunk_ids": chunk_ids
+    }
+
     return {"chunks_stored": len(points)}
 
+def get_all_documents():
+    return list(_documents.values())
+
+def delete_document(filename: str):
+    if filename not in _documents:
+        return {"status": "not_found", "filename": filename}
+
+    # Remove from Qdrant
+    chunk_ids = _documents[filename].get("chunk_ids", [])
+    if chunk_ids:
+        client.delete(
+            collection_name=COLLECTION_NAME,
+            points_selector=chunk_ids
+        )
+
+    # Remove from BM25 index
+    global _all_chunks
+    _all_chunks = [c for c in _all_chunks if c["source"] != filename]
+    _rebuild_bm25()
+
+    # Remove from registry
+    del _documents[filename]
+
+    return {"status": "deleted", "filename": filename}
+
 def search_documents(query: str, top_k: int = 5):
-    # Dense vector search
     query_vector = embedder.encode(query).tolist()
     vector_results = client.query_points(
         collection_name=COLLECTION_NAME,
@@ -108,7 +152,6 @@ def search_documents(query: str, top_k: int = 5):
         for r in vector_results
     }
 
-    # BM25 keyword search
     bm25_hits = {}
     if _bm25_index and _all_chunks:
         tokenized_query = query.lower().split()
@@ -126,7 +169,6 @@ def search_documents(query: str, top_k: int = 5):
                     "author": chunk.get("author", "unknown")
                 }
 
-    # Merge results - combine scores for overlapping hits
     merged = {}
     for text, hit in vector_hits.items():
         merged[text] = hit.copy()
@@ -137,6 +179,5 @@ def search_documents(query: str, top_k: int = 5):
         if text not in merged:
             merged[text] = hit
 
-    # Sort by final score
     final_results = sorted(merged.values(), key=lambda x: x["score"], reverse=True)[:top_k]
     return final_results

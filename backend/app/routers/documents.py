@@ -1,5 +1,5 @@
 from fastapi import APIRouter, UploadFile, File, Form
-from app.ingestion import ingest_document, search_documents
+from app.ingestion import ingest_document, search_documents, get_all_documents, delete_document
 from app.security import filter_results_by_role, mask_pii
 import shutil
 import os
@@ -16,12 +16,10 @@ async def upload_document(
     author: str = Form(default="unknown"),
     clearance_level: str = Form(default="public")
 ):
-    # Save file to disk
     file_path = os.path.join(UPLOAD_DIR, file.filename)
     with open(file_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
 
-    # Ingest into vector DB
     result = ingest_document(
         file_path=file_path,
         metadata={
@@ -39,13 +37,19 @@ async def upload_document(
 
 @router.get("/search")
 async def search(query: str, top_k: int = 5, role: str = "guest"):
-    # Mask PII in query
     clean_query = mask_pii(query)
-
-    # Search documents
     results = search_documents(query=clean_query, top_k=top_k)
-
-    # Filter by role
     filtered = filter_results_by_role(results, role)
-
     return {"results": filtered, "role": role}
+
+@router.get("/list")
+async def list_documents():
+    return {"documents": get_all_documents()}
+
+@router.delete("/delete/{filename}")
+async def delete_doc(filename: str):
+    result = delete_document(filename)
+    file_path = os.path.join(UPLOAD_DIR, filename)
+    if os.path.exists(file_path):
+        os.remove(file_path)
+    return result
